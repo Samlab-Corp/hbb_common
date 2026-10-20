@@ -92,6 +92,45 @@ message LoginRequest {
 
 message Terminal {
   string service_id = 1;  // Service ID for reconnecting to existing session
+  NativeManagementSession native_management = 2;
+}
+
+// Explicit, bounded management mode. Never opens an interactive terminal.
+// Old peers ignore this marker and cannot issue NativeManagementChallenge;
+// management clients must fail without sending OpenTerminal or input.
+message NativeManagementSession {
+  uint32 management_version = 1;
+  string operation_id = 2;
+  string command_hash = 3;
+  uint32 timeout_seconds = 4;
+  uint32 output_limit_bytes = 5;
+}
+
+message NativeManagementChallenge {
+  uint32 management_version = 1;
+  string operation_id = 2;
+  string command_hash = 3;
+  string challenge = 4;
+  string address_id = 5;
+}
+
+message NativeManagementExecute {
+  uint32 management_version = 1;
+  string operation_id = 2;
+  string grant_token = 3;
+  string command = 4;
+}
+
+message NativeManagementResult {
+  uint32 management_version = 1;
+  string operation_id = 2;
+  string status = 3;
+  string reason = 4;
+  int32 exit_code = 5;
+  bool exit_code_confirmed = 6;
+  bytes stdout = 7;
+  bytes stderr = 8;
+  bool executor_is_system = 9;
 }
 
 message Auth2FA {
@@ -981,5 +1020,8 @@ message Message {
     ScreenshotResponse screenshot_response= 30;
     TerminalAction terminal_action = 31;
     TerminalResponse terminal_response = 32;
+    NativeManagementExecute native_management_execute = 33;
+    NativeManagementChallenge native_management_challenge = 34;
+    NativeManagementResult native_management_result = 35;
   }
 }

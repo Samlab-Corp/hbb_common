@@ -93,6 +93,49 @@ message LoginRequest {
 message Terminal {
   string service_id = 1;  // Service ID for reconnecting to existing session
   NativeManagementSession native_management = 2;
+  KioskControlSession kiosk_control = 3;
+}
+
+// Fixed current-user non-PTY action. Old peers cannot acknowledge this mode;
+// callers must wait for the matching capability before sending any payload.
+message KioskControlSession {
+  uint32 control_version = 1;
+  string delivery_id = 2;
+  string operation_id = 3;
+  string expected_device_id = 4;
+  string wrapper_sha256 = 5;
+  string payload_sha256 = 6;
+  uint32 timeout_seconds = 7;
+  uint32 output_limit_bytes = 8;
+  bool probe_only = 9;
+}
+message KioskControlCapability {
+  uint32 control_version = 1;
+  string delivery_id = 2;
+  string operation_id = 3;
+  string expected_device_id = 4;
+  string wrapper_sha256 = 5;
+  string address_id = 6;
+  string challenge = 7;
+  string action = 8;
+  bool non_pty = 9;
+  bool current_user = 10;
+}
+message KioskControlExecute {
+  uint32 control_version = 1;
+  string delivery_id = 2;
+  string challenge = 3;
+  bytes payload = 4;
+}
+message KioskControlResult {
+  uint32 control_version = 1;
+  string delivery_id = 2;
+  string operation_id = 3;
+  string status = 4;
+  string reason = 5;
+  int32 exit_code = 6;
+  bool exit_code_confirmed = 7;
+  bytes receipt = 8;
 }
 
 // Explicit, bounded management mode. Never opens an interactive terminal.
@@ -1023,5 +1066,8 @@ message Message {
     NativeManagementExecute native_management_execute = 33;
     NativeManagementChallenge native_management_challenge = 34;
     NativeManagementResult native_management_result = 35;
+    KioskControlExecute kiosk_control_execute = 36;
+    KioskControlCapability kiosk_control_capability = 37;
+    KioskControlResult kiosk_control_result = 38;
   }
 }

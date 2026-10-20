@@ -120,6 +120,70 @@ const CHARS: &[char] = &[
 pub const RENDEZVOUS_SERVERS: &[&str] = &["r.letmeup.shop"];
 pub const RS_PUB_KEY: &str = "Xa5gkLwfyh8XZpT7Ttg+KdJJq0ACiuvRtLbUELTJKUk=";
 
+/// samlab: directory/file name of the machine-wide fixed ID file.
+/// On Windows the file is `%ProgramData%\LetmeupRemote\remote_id`.
+pub const FIXED_ID_DIR_NAME: &str = "LetmeupRemote";
+pub const FIXED_ID_FILE_NAME: &str = "remote_id";
+const FIXED_ID_MIN_LEN: usize = 6;
+const FIXED_ID_MAX_LEN: usize = 16;
+
+/// samlab: path of the fixed ID file, if the platform supports it.
+pub fn fixed_id_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("ProgramData")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+        return Some(base.join(FIXED_ID_DIR_NAME).join(FIXED_ID_FILE_NAME));
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// samlab: parse the content of the fixed ID file.
+///
+/// Accepts UTF-8 (with or without BOM) and UTF-16LE with BOM (PowerShell 5.1 default),
+/// uses the first non-empty line, trims surrounding whitespace and requires
+/// 6..=16 ASCII alphanumeric characters. Anything else is rejected (None).
+pub fn parse_fixed_id(bytes: &[u8]) -> Option<String> {
+    let text = if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        String::from_utf8_lossy(b).into_owned()
+    };
+    let line = text.lines().map(|l| l.trim()).find(|l| !l.is_empty())?;
+    if line.len() < FIXED_ID_MIN_LEN
+        || line.len() > FIXED_ID_MAX_LEN
+        || !line.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+/// samlab: the fixed ID read from `%ProgramData%\LetmeupRemote\remote_id`.
+///
+/// Returns None when the file does not exist or is invalid, in which case the
+/// stock RustDesk ID behavior is kept. The file is read on every call (it is tiny
+/// and only consulted on config load, id generation and id changes).
+pub fn fixed_id() -> Option<String> {
+    let path = fixed_id_path()?;
+    let bytes = fs::read(&path).ok()?;
+    let id = parse_fixed_id(&bytes);
+    if id.is_none() {
+        log::warn!("Ignoring invalid fixed id file {}", path.display());
+    }
+    id
+}
+
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
 pub const WS_RENDEZVOUS_PORT: i32 = 21118;
@@ -635,6 +699,15 @@ impl Config {
             id_valid = true;
             store = true;
         }
+        // samlab: a machine-wide fixed ID always wins over the stored or MAC-based one.
+        if let Some(fixed) = fixed_id() {
+            if config.id != fixed {
+                log::info!("Applying fixed id {} (was {:?})", fixed, config.id);
+                config.id = fixed;
+                store = true;
+            }
+            id_valid = true;
+        }
         if !id_valid {
             log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
@@ -986,6 +1059,17 @@ impl Config {
     }
 
     pub fn set_id(id: &str) {
+        // samlab: the fixed ID cannot be changed from inside the app.
+        let id = match fixed_id() {
+            Some(fixed) => {
+                if fixed != id {
+                    log::warn!("Refusing to change fixed id {} to {}", fixed, id);
+                }
+                fixed
+            }
+            None => id.to_owned(),
+        };
+        let id = id.as_str();
         let mut config = CONFIG.write().unwrap();
         if id == config.id {
             return;
@@ -1027,6 +1111,10 @@ impl Config {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn gen_id() -> Option<String> {
+        // samlab: prefer the machine-wide fixed ID over hostname/MAC based ids.
+        if let Some(fixed) = fixed_id() {
+            return Some(fixed);
+        }
         let hostname_as_id = BUILTIN_SETTINGS
             .read()
             .unwrap()
@@ -1278,6 +1366,12 @@ impl Config {
 
     pub fn update_id() {
         // to-do: how about if one ip register a lot of ids?
+        // samlab: never replace a fixed ID with a random one.
+        if let Some(fixed) = fixed_id() {
+            log::warn!("Skip updating fixed id {}", fixed);
+            Config::set_id(&fixed);
+            return;
+        }
         let id = Self::get_id();
         let mut rng = rand::thread_rng();
         let new_id = rng.gen_range(1_000_000_000..2_000_000_000).to_string();
@@ -1656,7 +1750,13 @@ impl Config {
 
     // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
     // This matches historical behavior, but may need revisiting in a separate PR.
-    pub fn set(cfg: Config) -> bool {
+    pub fn set(mut cfg: Config) -> bool {
+        // samlab: keep the fixed ID even when a whole config is pushed (e.g. via ipc sync).
+        if let Some(fixed) = fixed_id() {
+            if cfg.id != fixed {
+                cfg.id = fixed;
+            }
+        }
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
             return false;
@@ -4023,5 +4123,52 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    #[test]
+    fn test_parse_fixed_id() {
+        // plain, with CRLF and surrounding spaces (cmd `echo 000123 > file`)
+        assert_eq!(parse_fixed_id(b"000123\r\n"), Some("000123".to_owned()));
+        assert_eq!(parse_fixed_id(b"  000123 \r\n"), Some("000123".to_owned()));
+        assert_eq!(
+            parse_fixed_id(b"\r\n\r\nabc123XYZ\r\n"),
+            Some("abc123XYZ".to_owned())
+        );
+        // UTF-8 BOM
+        assert_eq!(
+            parse_fixed_id(b"\xEF\xBB\xBF000456\n"),
+            Some("000456".to_owned())
+        );
+        // UTF-16LE with BOM (PowerShell 5.1 Out-File default)
+        let mut utf16 = vec![0xFFu8, 0xFE];
+        for u in "000789\r\n".encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(parse_fixed_id(&utf16), Some("000789".to_owned()));
+        // length bounds 6..=16
+        assert_eq!(parse_fixed_id(b"12345"), None);
+        assert_eq!(parse_fixed_id(b"123456"), Some("123456".to_owned()));
+        assert_eq!(
+            parse_fixed_id(b"1234567890123456"),
+            Some("1234567890123456".to_owned())
+        );
+        assert_eq!(parse_fixed_id(b"12345678901234567"), None);
+        // invalid characters / empty
+        assert_eq!(parse_fixed_id(b"000 123"), None);
+        assert_eq!(parse_fixed_id(b"000-123"), None);
+        assert_eq!(parse_fixed_id(b"id=000123"), None);
+        assert_eq!(parse_fixed_id(b""), None);
+        assert_eq!(parse_fixed_id(b"   \r\n"), None);
+        assert_eq!(
+            parse_fixed_id("\u{AC00}\u{B098}\u{B2E4}\u{B77C}\u{B9C8}\u{BC14}".as_bytes()),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_fixed_id_path() {
+        let p = fixed_id_path().unwrap();
+        assert!(p.ends_with("LetmeupRemote\\remote_id"));
     }
 }

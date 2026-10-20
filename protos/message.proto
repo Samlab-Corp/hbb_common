@@ -94,6 +94,49 @@ message Terminal {
   string service_id = 1;  // Service ID for reconnecting to existing session
   NativeManagementSession native_management = 2;
   KioskControlSession kiosk_control = 3;
+  ReenrollmentSession reenrollment = 4;
+}
+
+// Purpose-separated fixed SYSTEM reenrollment RPC. No terminal input, arbitrary
+// command or credential payload is accepted. Legacy peers cannot acknowledge it.
+message ReenrollmentSession {
+  uint32 reenrollment_version = 1;
+  string delivery_id = 2;
+  string action = 3;
+  bytes scope_json = 4;
+  string guardian_sha256 = 5;
+  bool probe_only = 6;
+}
+message ReenrollmentCapability {
+  uint32 reenrollment_version = 1;
+  string delivery_id = 2;
+  string operation_id = 3;
+  string action = 4;
+  string command_hash = 5;
+  bytes scope_json = 6;
+  string guardian_sha256 = 7;
+  string address_id = 8;
+  string challenge = 9;
+  bool executor_is_system = 10;
+  uint32 executor_process_id = 11;
+  uint32 executor_session_id = 12;
+  bool non_pty = 13;
+  bytes guardian_capability = 14;
+}
+message ReenrollmentExecute {
+  uint32 reenrollment_version = 1;
+  string delivery_id = 2;
+  string challenge = 3;
+  string grant_token = 4;
+}
+message ReenrollmentResult {
+  uint32 reenrollment_version = 1;
+  string delivery_id = 2;
+  string operation_id = 3;
+  string status = 4;
+  string reason = 5;
+  bytes receipt = 6;
+  bool response_confirmed = 7;
 }
 
 // Fixed current-user non-PTY action. Old peers cannot acknowledge this mode;
@@ -1069,5 +1112,8 @@ message Message {
     KioskControlExecute kiosk_control_execute = 36;
     KioskControlCapability kiosk_control_capability = 37;
     KioskControlResult kiosk_control_result = 38;
+    ReenrollmentExecute reenrollment_execute = 39;
+    ReenrollmentCapability reenrollment_capability = 40;
+    ReenrollmentResult reenrollment_result = 41;
   }
 }

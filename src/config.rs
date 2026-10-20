@@ -322,6 +322,13 @@ pub enum PermanentPasswordUpdate {
     Rejected,
 }
 
+/// Public booleans only; no storage, salt or password escapes this snapshot.
+pub struct PermanentPasswordObservation {
+    pub new_matches: bool,
+    pub old_matches: bool,
+    pub persisted: bool,
+}
+
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Socks5Server {
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -1426,6 +1433,50 @@ impl Config {
     /// and mutation share CONFIG's write lock with the existing manual setter.
     pub fn set_permanent_password_if_blank_or_same(password: &str) -> PermanentPasswordUpdate {
         Self::set_permanent_password_guarded(password, true)
+    }
+
+    /// Dedicated SYSTEM reenrollment adapter only. The expected old value and
+    /// replacement share CONFIG's write lock with every existing password setter.
+    /// Existing installer and manual setter behavior is intentionally unchanged.
+    pub fn compare_exchange_permanent_password(old: &str, new: &str) -> PermanentPasswordUpdate {
+        if old.is_empty() || new.is_empty() || old == new || Self::is_disable_change_permanent_password() {
+            return PermanentPasswordUpdate::Rejected;
+        }
+        let mut config = CONFIG.write().unwrap();
+        // Never replace a shared preset or infer a missing local credential.
+        if config.password.is_empty() || !local_permanent_password_storage_matches_plain(&config.password, &config.salt, old) {
+            return PermanentPasswordUpdate::Conflict;
+        }
+        let Some(stored) = Self::compute_permanent_password_storage_for_update(&mut config, new) else {
+            return PermanentPasswordUpdate::Rejected;
+        };
+        config.password = stored;
+        config.store();
+        Self::clear_trusted_devices();
+        // The adapter must independently verify both memory and actual disk;
+        // store() logs write failures and this ACK alone is never proof.
+        PermanentPasswordUpdate::Accepted
+    }
+
+    /// The shared read lock excludes all normal/CAS setters until the bounded
+    /// disk read finishes. A caller must additionally exclude in-flight CAS work.
+    pub fn observe_permanent_password_pair(old: &str, new: &str) -> Option<PermanentPasswordObservation> {
+        use std::io::Read;
+        let (preset_storage,preset_salt)=Self::get_preset_password_storage_and_salt();
+        let config=CONFIG.read().ok()?;
+        let mut bytes=Vec::new();
+        std::fs::File::open(Self::file()).ok()?.take(1024*1024+1).read_to_end(&mut bytes).ok()?;
+        if bytes.len()>1024*1024{return None;}
+        let disk:toml::Value=std::str::from_utf8(&bytes).ok()?.parse().ok()?;
+        let storage=disk.get("password")?.as_str()?;
+        let salt=disk.get("salt")?.as_str()?;
+        let memory_matches=|password:&str|if config.password.is_empty(){
+            preset_permanent_password_storage_matches_plain(&preset_storage,&preset_salt,password)
+        }else{local_permanent_password_storage_matches_plain(&config.password,&config.salt,password)};
+        let disk_matches=|password:&str|!storage.is_empty() && local_permanent_password_storage_matches_plain(storage,salt,password);
+        let persisted=!config.password.is_empty() && storage==config.password && salt==config.salt;
+        Some(PermanentPasswordObservation{new_matches:persisted && memory_matches(new) && disk_matches(new),
+            old_matches:memory_matches(old)||disk_matches(old),persisted})
     }
 
     /// Side-effect-free effective-password verification for installer recovery.
@@ -3617,6 +3668,28 @@ mod tests {
             assert!(!Config::permanent_password_matches("manual-test-one"));
             assert!(Config::get() == before);
             assert_eq!(fs::read(Config::file()).unwrap(), disk);
+        });
+    }
+
+    #[test]
+    fn test_reenrollment_cas_competing_old_claims_have_one_winner_and_preserve_general_set() {
+        with_password_update_test(|| {
+            assert_eq!(Config::compare_exchange_permanent_password("old-fixture", "new-fixture"),PermanentPasswordUpdate::Conflict);
+            assert!(Config::set_permanent_password("old-fixture"));
+            let barrier=std::sync::Arc::new(std::sync::Barrier::new(4));
+            let workers:Vec<_>=(0..4).map(|n|{let barrier=barrier.clone();std::thread::spawn(move||{
+                barrier.wait();Config::compare_exchange_permanent_password("old-fixture",&format!("new-fixture-{n}"))
+            })}).collect();
+            let outcomes:Vec<_>=workers.into_iter().map(|v|v.join().unwrap()).collect();
+            assert_eq!(outcomes.iter().filter(|v|**v==PermanentPasswordUpdate::Accepted).count(),1);
+            assert_eq!(outcomes.iter().filter(|v|**v==PermanentPasswordUpdate::Conflict).count(),3);
+            assert!(!Config::permanent_password_matches("old-fixture"));
+            let winner=outcomes.iter().position(|v|*v==PermanentPasswordUpdate::Accepted).unwrap();
+            let snapshot=Config::observe_permanent_password_pair("old-fixture",&format!("new-fixture-{winner}")).unwrap();
+            assert!(snapshot.persisted && snapshot.new_matches && !snapshot.old_matches);
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("different-fixture"),PermanentPasswordUpdate::Conflict);
+            assert!(Config::set_permanent_password("manual-fixture"));
+            assert!(Config::permanent_password_matches("manual-fixture"));
         });
     }
 

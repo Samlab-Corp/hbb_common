@@ -52,6 +52,25 @@ pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
 
+#[cfg(test)]
+lazy_static::lazy_static! {
+    static ref TEST_CONFIG_DIR: PathBuf = {
+        if let Some(root) = std::env::var_os("HBB_COMMON_TEST_CONFIG_DIR") {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute() && root.is_dir(),
+                "test config directory must exist and be absolute"
+            );
+            root
+        } else {
+            let root = std::env::temp_dir()
+                .join(format!("hbb-common-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).expect("create isolated test config directory");
+            root
+        }
+    };
+}
+
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
     pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
@@ -131,6 +150,9 @@ const FIXED_ID_MAX_LEN: usize = 16;
 pub fn fixed_id_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
+        #[cfg(test)]
+        let base = TEST_CONFIG_DIR.join("ProgramData");
+        #[cfg(not(test))]
         let base = std::env::var_os("ProgramData")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -854,13 +876,17 @@ impl Config {
     }
 
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(test)]
+        {
+            TEST_CONFIG_DIR.join(p)
+        }
+        #[cfg(all(not(test), any(target_os = "android", target_os = "ios")))]
         {
             let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
             path.push(p);
             return path;
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(all(not(test), not(any(target_os = "android", target_os = "ios"))))]
         {
             #[cfg(not(target_os = "macos"))]
             let org = "".to_owned();
@@ -3448,6 +3474,7 @@ mod tests {
         test: impl FnOnce() -> R,
     ) -> R {
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
         let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
         test()
     }
@@ -3460,6 +3487,25 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_config_paths_are_isolated_from_user_profile() {
+        let path = Config::path("isolation-probe");
+        assert_eq!(path.parent(), Some(TEST_CONFIG_DIR.as_path()));
+        assert!(TEST_CONFIG_DIR.is_absolute() && TEST_CONFIG_DIR.is_dir());
+        assert_eq!(path, Config::path("isolation-probe"));
+        if std::env::var_os("HBB_COMMON_TEST_CONFIG_DIR").is_none() {
+            assert!(path.starts_with(std::env::temp_dir()));
+        }
+        let profile = directories_next::ProjectDirs::from("", "", &APP_NAME.read().unwrap())
+            .expect("user profile directory");
+        assert!(!path.starts_with(profile.config_dir()));
+        #[cfg(windows)]
+        assert!(fixed_id_path()
+            .unwrap()
+            .starts_with(TEST_CONFIG_DIR.as_path()));
+        eprintln!("isolated test config: {}", TEST_CONFIG_DIR.display());
     }
 
     #[test]
@@ -4083,7 +4129,9 @@ mod tests {
 
     #[test]
     fn test_store_load() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let peerconfig_id = "123456789";
+        let _file_guard = ConfigFileRestoreGuard::new(PeerConfig::path(peerconfig_id));
         let cfg: PeerConfig = Default::default();
         cfg.store(&peerconfig_id);
         assert_eq!(PeerConfig::load(&peerconfig_id), cfg);

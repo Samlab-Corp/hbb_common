@@ -29,6 +29,7 @@ pub use permanent_password::{
 use permanent_password::{
     decode_permanent_password_h1_from_hashed_storage, decrypt_permanent_password_str_or_original,
     encode_permanent_password_encrypted_storage_from_h1, password_is_empty_or_not_hashed,
+    local_permanent_password_storage_matches_plain,
     preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
 };
 
@@ -312,6 +313,13 @@ pub struct Config {
     key_confirmed: bool,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_bool")]
     keys_confirmed: HashMap<String, bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PermanentPasswordUpdate {
+    Accepted,
+    Conflict,
+    Rejected,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
@@ -1411,18 +1419,53 @@ impl Config {
     /// preset password. Returns `false` when changing the password is disabled or
     /// the new password cannot be prepared for storage.
     pub fn set_permanent_password(password: &str) -> bool {
+        Self::set_permanent_password_guarded(password, false) == PermanentPasswordUpdate::Accepted
+    }
+
+    /// Installation must never replace an existing different password. The check
+    /// and mutation share CONFIG's write lock with the existing manual setter.
+    pub fn set_permanent_password_if_blank_or_same(password: &str) -> PermanentPasswordUpdate {
+        Self::set_permanent_password_guarded(password, true)
+    }
+
+    /// Side-effect-free effective-password verification for installer recovery.
+    pub fn permanent_password_matches(password: &str) -> bool {
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        let config = CONFIG.read().unwrap();
+        if !config.password.is_empty() {
+            return local_permanent_password_storage_matches_plain(&config.password, &config.salt, password);
+        }
+        preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
+    }
+
+    fn set_permanent_password_guarded(password: &str, blank_or_same: bool) -> PermanentPasswordUpdate {
         if Self::is_disable_change_permanent_password() {
-            return false;
+            return PermanentPasswordUpdate::Rejected;
         }
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
-        if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
-        {
-            if CONFIG.read().unwrap().password.is_empty() {
-                return true;
+        let mut config = CONFIG.write().unwrap();
+        if blank_or_same {
+            if password.is_empty() {
+                return PermanentPasswordUpdate::Rejected;
+            }
+            if !config.password.is_empty() {
+                return if local_permanent_password_storage_matches_plain(&config.password, &config.salt, password) {
+                    PermanentPasswordUpdate::Accepted
+                } else {
+                    PermanentPasswordUpdate::Conflict
+                };
+            }
+            if !preset_storage.is_empty()
+                && !preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password) {
+                return PermanentPasswordUpdate::Conflict;
             }
         }
-
-        let mut config = CONFIG.write().unwrap();
+        if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
+        {
+            if config.password.is_empty() {
+                return PermanentPasswordUpdate::Accepted;
+            }
+        }
 
         let stored = if password.is_empty() {
             Some(String::new())
@@ -1431,15 +1474,15 @@ impl Config {
         };
         let Some(stored) = stored else {
             log::error!("Failed to compute permanent password storage; refusing update");
-            return false;
+            return PermanentPasswordUpdate::Rejected;
         };
         if stored == config.password {
-            return true;
+            return PermanentPasswordUpdate::Accepted;
         }
         config.password = stored;
         config.store();
         Self::clear_trusted_devices();
-        true
+        PermanentPasswordUpdate::Accepted
     }
 
     fn compute_permanent_password_storage_for_update(
@@ -3487,6 +3530,94 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    struct PasswordUpdateTestGuard {
+        config2: Config2,
+        trusted: (Vec<TrustedDevice>, bool),
+        builtin: HashMap<String, String>,
+    }
+    impl Drop for PasswordUpdateTestGuard {
+        fn drop(&mut self) {
+            *CONFIG2.write().unwrap() = self.config2.clone();
+            *TRUSTED_DEVICES.write().unwrap() = self.trusted.clone();
+            *BUILTIN_SETTINGS.write().unwrap() = self.builtin.clone();
+        }
+    }
+    fn with_password_update_test(test: impl FnOnce()) {
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            let _file2 = ConfigFileRestoreGuard::new(Config::file_("2"));
+            let _state = PasswordUpdateTestGuard {
+                config2: CONFIG2.read().unwrap().clone(),
+                trusted: TRUSTED_DEVICES.read().unwrap().clone(),
+                builtin: BUILTIN_SETTINGS.read().unwrap().clone(),
+            };
+            BUILTIN_SETTINGS.write().unwrap().clear();
+            test();
+        });
+    }
+
+    #[test]
+    fn test_installer_password_accepts_blank_and_same_but_preserves_conflicting_state() {
+        with_password_update_test(|| {
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("installer-test-one"), PermanentPasswordUpdate::Accepted);
+            let before = Config::get();
+            let disk = fs::read(Config::file()).unwrap();
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("installer-test-one"), PermanentPasswordUpdate::Accepted);
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("installer-test-two"), PermanentPasswordUpdate::Conflict);
+            assert!(Config::get() == before);
+            assert_eq!(fs::read(Config::file()).unwrap(), disk);
+            assert!(Config::permanent_password_matches("installer-test-one"));
+            assert!(!Config::permanent_password_matches("installer-test-two"));
+        });
+    }
+
+    #[test]
+    fn test_installer_password_competing_claims_have_exactly_one_winner() {
+        with_password_update_test(|| {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let workers: Vec<_> = (0..8).map(|n| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let password = format!("installer-test-{n}");
+                    barrier.wait();
+                    (Config::set_permanent_password_if_blank_or_same(&password), password)
+                })
+            }).collect();
+            let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+            assert_eq!(outcomes.iter().filter(|(result,_)| *result == PermanentPasswordUpdate::Accepted).count(), 1);
+            assert_eq!(outcomes.iter().filter(|(result,_)| *result == PermanentPasswordUpdate::Conflict).count(), 7);
+            let winner = outcomes.iter().find(|(result,_)| *result == PermanentPasswordUpdate::Accepted).unwrap();
+            assert!(Config::permanent_password_matches(&winner.1));
+        });
+    }
+
+    #[test]
+    fn test_installer_password_rejects_empty_disabled_and_preset_conflicts() {
+        with_password_update_test(|| {
+            assert_eq!(Config::set_permanent_password_if_blank_or_same(""), PermanentPasswordUpdate::Rejected);
+            BUILTIN_SETTINGS.write().unwrap().insert(keys::OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD.into(), "Y".into());
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("installer-test-one"), PermanentPasswordUpdate::Rejected);
+            BUILTIN_SETTINGS.write().unwrap().clear();
+            HARD_SETTINGS.write().unwrap().insert("password".into(), "preset-test-one".into());
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("installer-test-one"), PermanentPasswordUpdate::Conflict);
+            assert_eq!(Config::set_permanent_password_if_blank_or_same("preset-test-one"), PermanentPasswordUpdate::Accepted);
+            assert!(Config::get().password.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_manual_password_change_retains_overwrite_behavior_and_verify_does_not_write() {
+        with_password_update_test(|| {
+            assert!(Config::set_permanent_password("manual-test-one"));
+            assert!(Config::set_permanent_password("manual-test-two"));
+            let before = Config::get();
+            let disk = fs::read(Config::file()).unwrap();
+            assert!(Config::permanent_password_matches("manual-test-two"));
+            assert!(!Config::permanent_password_matches("manual-test-one"));
+            assert!(Config::get() == before);
+            assert_eq!(fs::read(Config::file()).unwrap(), disk);
+        });
     }
 
     #[test]
